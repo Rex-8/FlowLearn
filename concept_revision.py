@@ -1,0 +1,85 @@
+import os
+import json
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from dotenv import load_dotenv
+
+load_dotenv()
+
+llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=os.getenv("GOOGLE_API_KEY"))
+
+optimize_query_prompt_template = """
+You are an expert educational assistant. Your goal is to optimize the user's question for a knowledge base search and identify key topics for revision, taking into account the conversation context.
+
+1.  **Optimized Query:** Refine the question to be more specific and focused for revision purposes. If the question is already clear, return the original question unchanged. Ensure that the `optimized_query` is a concise rephrasing of the original question. Do not add any information that the user did not ask for.
+2.  **Topics:** Identify all possible topics of the question. Return a list of keywords related to the question.
+
+**Output Format:** Return a JSON object with "optimized_query" and "topics" keys.
+
+**Example:**
+**Question:** Remind me about the key concepts of quantum entanglement.
+**Output:**
+{{
+  "optimized_query": "What are the key concepts of quantum entanglement?",
+  "topics": ["quantum entanglement", "quantum mechanics", "entanglement"]
+}}
+
+**Conversation Context:** {conversation_context}
+
+**Question:** {user_prompt}
+
+**Output:**
+"""
+
+persist_directory = './FlowLearn/langchain_integration/chroma.db'
+
+embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+collection = Chroma(
+    persist_directory=persist_directory,
+    embedding_function=embedding_function
+)
+
+optimize_query_prompt = PromptTemplate(input_variables=["user_prompt", "subject", "conversation_context"], template=optimize_query_prompt_template)
+optimize_query_chain = optimize_query_prompt | llm | StrOutputParser()
+
+def concept_revision(subject, user_prompt, conversation_context=""):
+    try:
+        llm_output = optimize_query_chain.invoke({"user_prompt": user_prompt, "subject": subject, "conversation_context": conversation_context})
+        data = json.loads(llm_output)
+        optimized_query = data['optimized_query']
+        topics = data['topics']
+        print(optimized_query,topics)
+        context = []
+        for topic in topics:
+            search_results = collection.similarity_search(
+                topic,
+                k=2,
+                filter={"subject": subject}
+            )
+            context.extend([doc.page_content for doc in search_results])
+        if context:
+            gemini_prompt = f"""
+            You are an expert in {subject}. Based on the following information, provide a concise revision of: {optimized_query}. Focus on the most important aspects and get straight to the point. Keep your explanation extremely brief (under 100 words). Cite the specific documents from the `Context` that support your explanation. Take the previous converastion into account.
+
+            Context:
+            {chr(10).join(context)}
+
+            Revision:
+            """
+            revision = llm.invoke(gemini_prompt)
+        else:
+            revision = "I'm sorry, I couldn't find relevant information in the knowledge base for revision. Please try rephrasing your question or providing more context."
+
+    except Exception as e:
+        revision = f"An error occurred during the concept revision workflow: {e}"
+        print(f"Error during concept_revision: {e}")
+
+    return revision
+
+if __name__ == '__main__':
+    revision = concept_revision(subject="Phy", user_prompt="Dimensional Analysis")
+    print(revision)
